@@ -1,103 +1,111 @@
+#include <MadgwickAHRS.h>
 #include <PID_v1.h>
 #include <Servo.h>
 #include <Arduino_LSM9DS1.h>
 #include <Wire.h>
 
+//----Madgwick AHRS Setup/Variables
+Madgwick filter;
+unsigned long microsPerReading, microsPrevious;
+float aRX, aRY, aRZ; //Raw values
+float gRX, gRY, gRZ;
+float aX, aY, aZ; // Converted values
+float gX, gY, gZ;
+float roll, pitch, heading;
+unsigned long microsNow;
+
+//----PID Variables
 double Pk = 2.0;
 double Ik = 0.0;
 double Dk = 0.0;
-
 double Setpoint = 0.2;
 double Input;
 double Output;
-PID PID1(&Input, &Output, &Setpoint, Pk, Ik , Dk, P_ON_M , DIRECT); // PID Setup
+PID PID(&Input, &Output, &Setpoint, Pk, Ik , Dk, P_ON_M , DIRECT); // PID Setup
 
-
-float accelX,            accelY,             accelZ,            // units m/s/s i.e. accelZ if often 9.8 (gravity)
-      gyroX,             gyroY,              gyroZ,             // units dps (degrees per second)
-      gyroRoll,          gyroPitch,          // units degrees (expect major drift)
-      accRoll,           accPitch,            // units degrees (roll and pitch noisy)
-      complementaryRoll, complementaryPitch;  // units degrees (excellent roll, pitch)
-
-float Time;
-unsigned long lastTime;
-
-byte motorPin = 9; // signal pin for the ESC.
-byte servoPin = 8;
-
+//----Motor & Servo setup
 Servo motor;
+byte motorPin = 9; // signal pin for the ESC.
 Servo servo;
+byte servoPin = 8; // servo signal pin
 
 int servPos = 130; // 90 degrees is level for gyro platter 5-175 range
 int escSpeed = 900; // lowest signal aka off throttle 900 - 2000 pwm value
 
 void setup() {
+  Serial.begin(9600);
+
   motor.attach(motorPin);
   servo.attach(servoPin);
 
-  PID1.SetMode(AUTOMATIC);
-  PID1.SetOutputLimits(-220000, 220000);
-  PID1.SetSampleTime(10);
+  PID.SetMode(AUTOMATIC);
+  PID.SetOutputLimits(-220000, 220000);
+  PID.SetSampleTime(10);
 
   motor.writeMicroseconds(escSpeed); // send "stop" signal to ESC. Also necessary to arm the ESC.
   servo.write(servPos);
-  Serial.begin(9600);
 
+  // Start the IMU and filter
   if (!IMU.begin()) {
     Serial.println("Failed to initialize IMU!");
     while (1);
   }
 
-  delay(1500); // delay to allow the ESC to recognize the stopped signal.
+  filter.begin(10);
 
-  escSpeed = 2000; //disable to prevent gyro from starting automatically
+  delay(1500); // Delay to allow the ESC to recognize the stopped signal.
+
+  escSpeed = 2000; //*NOTE* Set to 900 prevent gyro from starting automatically
   motor.writeMicroseconds(escSpeed);
 
-  delay(3000);
+  delay(3000); //Delay to allow gyro to get up to speed
 
-  lastTime = millis();
+  // Initialize variables to pace updates to correct rate
+  microsPerReading = 1000000;
+  microsPrevious = micros();
 }
 
 void loop() {
-  readIMU();
-  calcAngle();
+  microsNow = micros();
+  if (microsNow - microsPrevious >= microsPerReading) {
 
-  Input = complementaryPitch;
+    readIMU();
 
-  PID1.Compute();
-  Output = constrain(Output, -35, 35);
+    // convert from raw data to gravity and degrees/second units
+    aX = convertRawAcceleration(aRX);
+    aY = convertRawAcceleration(aRY);
+    aZ = convertRawAcceleration(aRZ);
+    gX = convertRawGyro(gRX);
+    gY = convertRawGyro(gRY);
+    gZ = convertRawGyro(gRZ);
 
-  servPos = 130 + Output; // add or subtract roll
-  //servo.write(servPos); // move servo
+    // update the filter, which computes orientation
+    filter.updateIMU(gX, gY, gZ, aX, aY, aZ);
 
-  motor.writeMicroseconds(escSpeed); // Send signal to ESC.
+    // print the heading, pitch and roll
+    roll = filter.getRoll();
+    pitch = filter.getPitch();
+    heading = filter.getYaw();
 
-  Serial.print(Output);
-  Serial.print(',');
-  Serial.print(accRoll);
-  Serial.print(',');
-  Serial.print(gyroRoll);
-  Serial.print(',');
-  Serial.print(complementaryRoll);
-  Serial.print(',');
-  Serial.println(servPos);
+    Serial.print("Orientation: ");
+    Serial.print(heading);
+    Serial.print(" ");
+    Serial.print(pitch);
+    Serial.print(" ");
+    Serial.println(roll);
 
-  delay(10);
+    Input = pitch;
+    PID.Compute();
+    Output = constrain(Output, -35, 35);
+
+    servPos = 130 + Output; // add or subtract roll
+    motor.writeMicroseconds(escSpeed); // Send signal to ESC.
+
+    // Increment previous time, so we keep proper pace
+    microsPrevious = microsPrevious + microsPerReading;
+  }
 }
 
-void calcAngle() {
-  accRoll = -atan2(accelX / 9.8, accelZ / 9.8) / 2 / 3.141592654 * 360;
-  accPitch = -atan2(accelY / 9.8, accelZ / 9.8) / 2 / 3.141592654 * 360;
-
-  Time = (millis() - lastTime) / 1000;
-  lastTime = millis();
-
-  gyroRoll = gyroRoll + (gyroX / lastTime);
-  gyroPitch = gyroPitch + (gyroY / lastTime);
-
-  complementaryRoll = 0.95 * gyroRoll + 0.05 * accRoll;
-  complementaryPitch = 0.95 * gyroPitch + 0.05 * accPitch;  // Complementary filter favors gyro short term acccelerometer long term
-}
 
 /**
   Read accel and gyro data.
@@ -105,9 +113,27 @@ void calcAngle() {
 */
 bool readIMU() {
   if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable() ) {
-    IMU.readAcceleration(accelX, accelY, accelZ);
-    IMU.readGyroscope(gyroX, gyroY, gyroZ);
+    IMU.readAcceleration(aRX, aRY, aRZ);
+    IMU.readGyroscope(gRX, gRY, gRZ);
     return true;
   }
   return false;
+}
+
+float convertRawAcceleration(int aRaw) {
+  // since we are using 4 g range
+  // -4 g maps to a raw value of -32768
+  // +4 g maps to a raw value of 32767
+
+  float a = (aRaw * 4.0) / 32768.0;
+  return a;
+}
+
+float convertRawGyro(int gRaw) {
+  // since we are using 2000 degrees/seconds range
+  // -2000 maps to a raw value of -32768
+  // +2000 maps to a raw value of 32767
+
+  float g = (gRaw * 2000.0) / 32768.0;
+  return g;
 }
